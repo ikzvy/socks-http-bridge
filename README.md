@@ -42,6 +42,7 @@
 | `bridge/socks-http-bridge.js` | 代理桥本体（含国内域名分流） |
 | `bridge/update-cn-rules.js` | 规则更新器（下载/解析/去重社区规则源） |
 | `install.ps1` | 一键安装（部署脚本 + 系统代理 + 环境变量 + 计划任务） |
+| `deploy.ps1` | 更新部署：改完代码后同步到运行目录并重启桥（开发用） |
 | `uninstall.ps1` | 一键卸载，恢复直连 |
 
 ## 安装
