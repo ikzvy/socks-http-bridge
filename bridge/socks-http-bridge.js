@@ -168,30 +168,39 @@ function directDial(destHost, destPort) {
   });
 }
 
-// 其余未知流量：SOCKS 优先，失败降级直连。
-// 必须保留：VPN 客户端自身的引导 API（api.wr001.net 等）在隧道未建立时
-// 只能直连可达；否则形成"连 VPN 需要走 VPN"的死锁，客户端永远连不上。
-// 泄露风险由强制名单兜底：真正的敏感目标（Google/OpenAI 等）不走这里。
-function dial(destHost, destPort) {
-  return socksDial(destHost, destPort).catch((e) => {
-    log(`socks unavailable for ${destHost}:${destPort} (${e.message}), falling back to direct`);
-    return directDial(destHost, destPort);
-  });
+// VPN 客户端（Anycast）自身引导 API：隧道未建立时必须直连可达，
+// 否则形成"连 VPN 需要走 VPN"的死锁。这些域名国内可直连，无泄露风险。
+const DIRECT_SUFFIXES = new Set([
+  'wr001.net', 'wmppt.com', 'yidianyq.com',
+]);
+
+function isDirect(host) {
+  const h = (host || '').toLowerCase().replace(/\.$/, '');
+  if (!h || /^[0-9a-f:.]+$/.test(h)) return false;
+  const labels = h.split('.');
+  for (let i = 0; i < labels.length - 1; i++) {
+    if (DIRECT_SUFFIXES.has(labels.slice(i).join('.'))) return true;
+  }
+  return false;
 }
 
-// 路由决策：国外强制名单（只进隧道，永不降级）> 国内规则直连 > 其余 SOCKS+降级
+// 路由决策：引导白名单直连 > 国外强制名单（只进隧道，永不直连）>
+// 国内规则直连 > 其余只进 SOCKS（失败即 502，绝不降级直连）。
+// 全桥不存在任何"以国内真实 IP 访问国外服务"的路径。
 function chooseAndDial(destHost, destPort) {
   ensureRules();
+  if (isDirect(destHost)) {
+    log(`direct by bootstrap rule: ${destHost}:${destPort}`);
+    return directDial(destHost, destPort);
+  }
   if (isForeign(destHost)) {
-    // 强制名单（Google/OpenAI/Anthropic 等）：SOCKS 不可用即 502，
-    // 绝不降级直连，防止 VPN 断开时以国内真实 IP 直连造成泄露与风控断连。
     return socksDial(destHost, destPort);
   }
   if (isDomestic(destHost)) {
     log(`direct by cn rule: ${destHost}:${destPort}`);
     return directDial(destHost, destPort);
   }
-  return dial(destHost, destPort);
+  return socksDial(destHost, destPort);
 }
 
 function pipePair(a, b) {
