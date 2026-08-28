@@ -167,17 +167,24 @@ function directDial(destHost, destPort) {
   });
 }
 
-// 国外流量只走 SOCKS，不降级直连（防止 VPN 断开时以国内真实 IP 直连
-// Google/OpenAI 等服务造成 IP 泄露与风控断连；SOCKS 不可用即返回 502）。
+// 其余未知流量：SOCKS 优先，失败降级直连。
+// 必须保留：VPN 客户端自身的引导 API（api.wr001.net 等）在隧道未建立时
+// 只能直连可达；否则形成"连 VPN 需要走 VPN"的死锁，客户端永远连不上。
+// 泄露风险由强制名单兜底：真正的敏感目标（Google/OpenAI 等）不走这里。
 function dial(destHost, destPort) {
-  return socksDial(destHost, destPort);
+  return socksDial(destHost, destPort).catch((e) => {
+    log(`socks unavailable for ${destHost}:${destPort} (${e.message}), falling back to direct`);
+    return directDial(destHost, destPort);
+  });
 }
 
-// 路由决策：国外强制名单 > 国内规则直连 > 其余走 SOCKS（不降级直连）
+// 路由决策：国外强制名单（只进隧道，永不降级）> 国内规则直连 > 其余 SOCKS+降级
 function chooseAndDial(destHost, destPort) {
   ensureRules();
   if (isForeign(destHost)) {
-    return dial(destHost, destPort);
+    // 强制名单（Google/OpenAI/Anthropic 等）：SOCKS 不可用即 502，
+    // 绝不降级直连，防止 VPN 断开时以国内真实 IP 直连造成泄露与风控断连。
+    return socksDial(destHost, destPort);
   }
   if (isDomestic(destHost)) {
     log(`direct by cn rule: ${destHost}:${destPort}`);
