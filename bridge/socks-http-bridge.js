@@ -1,8 +1,9 @@
 'use strict';
 // HTTP -> SOCKS5 bridge for Codex Desktop + Anycast (resident mode)
 // Listens as an HTTP proxy and forwards through the local SOCKS5 port.
-// If the SOCKS upstream is unavailable (Anycast not connected), falls back
-// to direct connection so domestic traffic keeps working.
+// Foreign traffic NEVER falls back to direct (IP-leak protection):
+// if the SOCKS upstream is down, requests fail with 502 instead of
+// leaking the real (CN) IP to Google/OpenAI etc.
 //
 // 2026-08-25 升级：接入国内域名规则文件 ~/.codex/cn-domains.txt
 // （由 update-cn-rules.js 从 Loyalsoldier/clash-rules + dnsmasq-china-list 生成）。
@@ -17,8 +18,24 @@ const LISTEN_HOST = '127.0.0.1';
 const LISTEN_PORT = 18080;
 const SOCKS_HOST = '127.0.0.1';
 const SOCKS_PORT = 1080;
-const SOCKS_CONNECT_TIMEOUT_MS = 2000;
+const SOCKS_CONNECT_TIMEOUT_MS = 5000;
 const RULES_FILE = path.join(os.homedir(), '.codex', 'cn-domains.txt');
+
+// 强制走 SOCKS 隧道的国外域名后缀（优先级高于 cn-domains.txt）。
+// 背景：dnsmasq-china-list 收录了大量历史原因保留的 Google 域名
+// （www.gstatic.com、fonts.googleapis.com 等），这些域名在大陆直连是
+// 被墙的，直连既会卡死网页资源，也会向 Google 暴露国内真实 IP。
+const FOREIGN_SUFFIXES = new Set([
+  // Google / Gemini / YouTube
+  'google.com', 'gstatic.com', 'googleapis.com', 'googleusercontent.com',
+  'ggpht.com', 'gvt1.com', 'gvt2.com', 'youtube.com', 'ytimg.com',
+  'googlevideo.com', 'googlesource.com', 'googleadservices.com',
+  'doubleclick.net', 'withgoogle.com',
+  // OpenAI / ChatGPT
+  'openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com',
+  // Anthropic / xAI
+  'anthropic.com', 'claude.ai', 'x.ai',
+]);
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -52,6 +69,17 @@ function ensureRules() {
     const m = fs.statSync(RULES_FILE).mtimeMs;
     if (m > cnMtime) loadRules();
   } catch (e) { /* 文件不在就保持现状 */ }
+}
+
+// 强制走隧道的国外域名：host 自身或任一父域命中名单即判定国外
+function isForeign(host) {
+  const h = (host || '').toLowerCase().replace(/\.$/, '');
+  if (!h || /^[0-9a-f:.]+$/.test(h)) return false; // IP 字面量不判断
+  const labels = h.split('.');
+  for (let i = 0; i < labels.length - 1; i++) {
+    if (FOREIGN_SUFFIXES.has(labels.slice(i).join('.'))) return true;
+  }
+  return false;
 }
 
 // 域名后缀匹配：host 自身或任一父域命中规则集即判定国内
@@ -139,17 +167,18 @@ function directDial(destHost, destPort) {
   });
 }
 
-// Try SOCKS first; fall back to direct if Anycast is unavailable.
+// 国外流量只走 SOCKS，不降级直连（防止 VPN 断开时以国内真实 IP 直连
+// Google/OpenAI 等服务造成 IP 泄露与风控断连；SOCKS 不可用即返回 502）。
 function dial(destHost, destPort) {
-  return socksDial(destHost, destPort).catch((e) => {
-    log(`socks unavailable for ${destHost}:${destPort} (${e.message}), falling back to direct`);
-    return directDial(destHost, destPort);
-  });
+  return socksDial(destHost, destPort);
 }
 
-// 路由决策：国内域名直连，其余进 SOCKS（失败再降级直连）
+// 路由决策：国外强制名单 > 国内规则直连 > 其余走 SOCKS（不降级直连）
 function chooseAndDial(destHost, destPort) {
   ensureRules();
+  if (isForeign(destHost)) {
+    return dial(destHost, destPort);
+  }
   if (isDomestic(destHost)) {
     log(`direct by cn rule: ${destHost}:${destPort}`);
     return directDial(destHost, destPort);
