@@ -31,6 +31,7 @@ const FOREIGN_SUFFIXES = new Set([
   'ggpht.com', 'gvt1.com', 'gvt2.com', 'youtube.com', 'ytimg.com',
   'googlevideo.com', 'googlesource.com', 'googleadservices.com',
   'doubleclick.net', 'withgoogle.com',
+  'google-analytics.com', 'googletagmanager.com',
   // OpenAI / ChatGPT
   'openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com',
   // Anthropic / xAI
