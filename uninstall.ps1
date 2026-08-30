@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # socks-http-bridge 卸载脚本（右键 -> 使用 PowerShell 运行）
 # 移除计划任务、脚本文件、环境变量；系统代理改回直连。
 # ============================================================
@@ -35,7 +35,7 @@ public static extern bool InternetSetOptionW(System.IntPtr hInternet, int dwOpti
 [Win32.Native]::InternetSetOptionW([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
 
 Write-Host '=== [4/5] 删除脚本与规则文件 ===' -ForegroundColor Cyan
-foreach ($f in @('socks-http-bridge.js','update-cn-rules.js','cn-domains.txt','socks-http-bridge.js.bak-20260825')) {
+foreach ($f in @('socks-http-bridge.js','update-cn-rules.js','cn-domains.txt','run-hidden.vbs','socks-http-bridge.js.bak-20260825')) {
     Remove-Item (Join-Path $codex $f) -ErrorAction SilentlyContinue
 }
 Write-Host '（日志文件 socks-http-bridge.log / .err.log 保留，可手动删除）'

@@ -13,6 +13,7 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execFile } = require('child_process');
 
 const LISTEN_HOST = '127.0.0.1';
 const LISTEN_PORT = 18080;
@@ -20,6 +21,7 @@ const SOCKS_HOST = '127.0.0.1';
 const SOCKS_PORT = 1080;
 const SOCKS_CONNECT_TIMEOUT_MS = 5000;
 const RULES_FILE = path.join(os.homedir(), '.codex', 'cn-domains.txt');
+const LOG_FILE = path.join(os.homedir(), '.codex', 'socks-http-bridge.log');
 
 // 强制走 SOCKS 隧道的国外域名后缀（优先级高于 cn-domains.txt）。
 // 背景：dnsmasq-china-list 收录了大量历史原因保留的 Google 域名
@@ -39,7 +41,13 @@ const FOREIGN_SUFFIXES = new Set([
 ]);
 
 function log(msg) {
-  console.log(`[${new Date().toISOString()}] ${msg}`);
+  const line = `[${new Date().toISOString()}] ${msg}`;
+  console.log(line);
+  // 计划任务以裸 `node xxx.js` 启动，stdout 无人接管；日志必须由桥自己落盘，
+  // 否则 README/AGENTS.md 指的 socks-http-bridge.log 永远不会生成。
+  try {
+    fs.appendFileSync(LOG_FILE, line + '\n');
+  } catch (e) { /* 日志写不进去不能影响代理 */ }
 }
 
 // ---- 国内域名规则 ----
@@ -174,9 +182,16 @@ const DIRECT_SUFFIXES = new Set([
   'wr001.net', 'wmppt.com', 'yidianyq.com',
 ]);
 
+// Anycast 已改用随机子域做引导 API，实测子域的 hex 长度会轮换（同时见到
+// 7 位 api.8a5da52.com 与 9 位 api.083587cba.com）。把长度锁死在 9 会漏掉
+// 短的子域、重新制造掉线后连不回来的死锁；放宽到 5~12 位，这个形状仍足够
+// 具体，正常国外服务基本不可能撞上。
+const BOOTSTRAP_API_RE = /^api\.[0-9a-f]{5,12}\.com$/;
+
 function isDirect(host) {
   const h = (host || '').toLowerCase().replace(/\.$/, '');
   if (!h || /^[0-9a-f:.]+$/.test(h)) return false;
+  if (BOOTSTRAP_API_RE.test(h)) return true;
   const labels = h.split('.');
   for (let i = 0; i < labels.length - 1; i++) {
     if (DIRECT_SUFFIXES.has(labels.slice(i).join('.'))) return true;
@@ -283,3 +298,86 @@ server.on('error', (e) => {
   log('listen error: ' + e.message);
   process.exit(1);
 });
+
+// ---- 看门狗：系统代理跟着 VPN 隧道自动联动 ----
+// 背景：用户关掉 VPN 后隧道(1080)消失，但系统代理仍指着 127.0.0.1:18080，
+// 于是"没进国内规则、也不是国外强制名单"的流量（纯 IP 连接、未收录域名等）
+// 全部被塞进已死的隧道 -> 国内国外一起挂。正确姿势是"关 VPN 就关代理"，
+// 之前只能手动切，这里让桥自动做：
+//   1080 持续不通 且 代理开着   -> 切 TUN（关代理），恢复直连
+//   1080 恢复     且 代理关着   -> 切 Bridge（开代理）
+// 注意：切到 TUN 期间，国外流量是国内真实 IP 直连——这正是用户关 VPN 想要的
+// "正常上网"，不属于桥的防泄露降级（桥进程还在，只是系统代理不再指向它）。
+// 只在探测阈值满足且当前状态不符时才动作，避免瞬断抖动来回切。
+// 放一个空文件 ~/.codex/watchdog-disabled 即可完全停用看门狗。
+const WATCHDOG_INTERVAL_MS = 5000;
+const WATCHDOG_DOWN_THRESHOLD = 3; // 连续约 15s 不通才切走
+const WATCHDOG_UP_THRESHOLD = 2;   // 连续约 10s 恢复才切回
+const SWITCH_MODE_SCRIPT = path.join(os.homedir(), '.codex', 'switch-mode.ps1');
+const WATCHDOG_DISABLED_FLAG = path.join(os.homedir(), '.codex', 'watchdog-disabled');
+const PROXY_REG = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
+
+let wdDownStreak = 0;
+let wdUpStreak = 0;
+let wdBusy = false; // 一次只跑一个切换，避免重叠
+
+function probeSocks() {
+  return new Promise((resolve) => {
+    const s = net.connect(SOCKS_PORT, SOCKS_HOST);
+    const timer = setTimeout(() => { s.destroy(); resolve(false); }, 3000);
+    s.on('connect', () => { clearTimeout(timer); s.destroy(); resolve(true); });
+    s.on('error', () => { clearTimeout(timer); s.destroy(); resolve(false); });
+  });
+}
+
+function readProxyEnable() {
+  return new Promise((resolve) => {
+    execFile('reg.exe', ['query', PROXY_REG, '/v', 'ProxyEnable'], (err, stdout) => {
+      if (err) return resolve(null);
+      const m = /ProxyEnable\s+REG_DWORD\s+0x([0-9a-fA-F]+)/i.exec(stdout || '');
+      resolve(m ? parseInt(m[1], 16) === 1 : null);
+    });
+  });
+}
+
+function runSwitchMode(mode) {
+  execFile('powershell.exe',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', SWITCH_MODE_SCRIPT, '-Mode', mode],
+    { timeout: 30000 },
+    (err) => {
+      wdBusy = false;
+      if (err) log(`watchdog: switch-mode ${mode} 失败: ${err.message}`);
+      else log(`watchdog: 系统代理已切换到 ${mode}`);
+    });
+}
+
+async function watchdogTick() {
+  try {
+    if (fs.existsSync(WATCHDOG_DISABLED_FLAG)) return;
+    const up = await probeSocks();
+    if (up) { wdUpStreak++; wdDownStreak = 0; } else { wdDownStreak++; wdUpStreak = 0; }
+
+    if (wdBusy) return;
+    if (wdDownStreak >= WATCHDOG_DOWN_THRESHOLD) {
+      wdDownStreak = 0;
+      if ((await readProxyEnable()) === true) {
+        wdBusy = true;
+        log('watchdog: 隧道(1080)持续不通，自动把系统代理切到 TUN');
+        runSwitchMode('TUN');
+      }
+    } else if (wdUpStreak >= WATCHDOG_UP_THRESHOLD) {
+      wdUpStreak = 0;
+      if ((await readProxyEnable()) === false) {
+        wdBusy = true;
+        log('watchdog: 隧道(1080)已恢复，自动把系统代理切到 Bridge');
+        runSwitchMode('Bridge');
+      }
+    }
+  } catch (e) {
+    wdBusy = false;
+    log('watchdog: tick 出错 ' + e.message);
+  }
+}
+
+setInterval(watchdogTick, WATCHDOG_INTERVAL_MS);
+watchdogTick();

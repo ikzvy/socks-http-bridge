@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # socks-http-bridge 模式切换脚本
 # 用法（右键"使用 PowerShell 运行"不行，需带参数）：
 #   pwsh -File switch-mode.ps1 -Mode TUN     # Anycast 用 TUN 模式时
@@ -26,7 +26,7 @@ if ($Mode -eq 'TUN') {
         [Environment]::SetEnvironmentVariable($v.ToLower(), $null, 'User')
     }
     Write-Host '已关闭系统代理，已清除 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY 环境变量'
-    Write-Host '注意：已在运行的程序（浏览器/Antigravity）需完全重启后才会放弃旧代理设置'
+    Write-Host '注意：大部分程序会立即生效；个别缓存较深的程序可能仍需重启'
 }
 else {
     Write-Host '=== 切换到 Bridge 模式（本桥接管系统代理）===' -ForegroundColor Cyan
@@ -48,6 +48,16 @@ else {
     Write-Host '已开启系统代理 127.0.0.1:18080 并写入代理环境变量'
 }
 
+# 广播代理设置变更，让已在运行的程序（浏览器等）立即感知，无需重启。
+# 不加这步，只有新启动的进程才会读到新的代理设置，看门狗的自动切换就对
+# 已经打开的浏览器不生效。
+Add-Type -Namespace Win32 -Name Native -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("wininet.dll", SetLastError=true)]
+public static extern bool InternetSetOptionW(System.IntPtr hInternet, int dwOption, System.IntPtr lpBuffer, int dwBufferLength);
+'@
+[Win32.Native]::InternetSetOptionW([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+[Win32.Native]::InternetSetOptionW([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+
 Write-Host '=== 当前状态 ===' -ForegroundColor Cyan
 Get-ItemProperty $inets | Select-Object ProxyEnable, ProxyServer | Format-List
-Write-Host '完成。切换模式后请完全重启浏览器/Antigravity 等应用。'
+Write-Host '完成。代理变更已广播，大多数程序立即生效。'
