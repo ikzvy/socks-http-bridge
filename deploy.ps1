@@ -10,6 +10,7 @@ $codex = Join-Path $env:USERPROFILE '.codex'
 Write-Host '=== [1/4] 同步脚本到运行目录 ===' -ForegroundColor Cyan
 Copy-Item "$root\bridge\socks-http-bridge.js" "$codex\socks-http-bridge.js" -Force
 Copy-Item "$root\bridge\update-cn-rules.js" "$codex\update-cn-rules.js" -Force
+Copy-Item "$root\switch-mode.ps1" "$codex\switch-mode.ps1" -Force
 Write-Host "已同步到 $codex"
 
 Write-Host '=== [2/4] 重启桥进程 ===' -ForegroundColor Cyan
