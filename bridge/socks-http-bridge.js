@@ -332,7 +332,7 @@ function probeSocks() {
 
 function readProxyEnable() {
   return new Promise((resolve) => {
-    execFile('reg.exe', ['query', PROXY_REG, '/v', 'ProxyEnable'], (err, stdout) => {
+    execFile('reg.exe', ['query', PROXY_REG, '/v', 'ProxyEnable'], { windowsHide: true }, (err, stdout) => {
       if (err) return resolve(null);
       const m = /ProxyEnable\s+REG_DWORD\s+0x([0-9a-fA-F]+)/i.exec(stdout || '');
       resolve(m ? parseInt(m[1], 16) === 1 : null);
@@ -343,7 +343,7 @@ function readProxyEnable() {
 function runSwitchMode(mode) {
   execFile('powershell.exe',
     ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', SWITCH_MODE_SCRIPT, '-Mode', mode],
-    { timeout: 30000 },
+    { timeout: 30000, windowsHide: true },
     (err) => {
       wdBusy = false;
       if (err) log(`watchdog: switch-mode ${mode} 失败: ${err.message}`);
