@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 $inets = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 $codex = Join-Path $env:USERPROFILE '.codex'
 # 与 install.ps1 保持一致的高频国内域名绕过名单
-$noProxy = 'localhost,127.0.0.1,::1,qoder.com.cn,qoder.com,qoder.cn,qoder.sh,aliyuncs.com,codebuddy.cn,codebuddy.com,doubao.com,cici.com,dola.com,volces.com,volcengine.com,xiaoheihe.net,heybox.com,maxjia.com,steamstatic.com,epicgames.com,battlenet.com,blizzard.com,ea.com,ubisoft.com,riotgames.com,rockstargames.com,hdslb.com,bilivideo.com,bilivideo.cn,biliapi.net,biliapi.com,bcdn.net,acgvideo.com,im9.com,polymas.com'
+$noProxy = 'localhost,127.0.0.1,::1,qoder.com.cn,qoder.com,qoder.cn,qoder.sh,aliyuncs.com,codebuddy.cn,codebuddy.com,doubao.com,cici.com,dola.com,volces.com,volcengine.com,xiaoheihe.net,heybox.com,maxjia.com,steamstatic.com,epicgames.com,battlenet.com,blizzard.com,ea.com,ubisoft.com,riotgames.com,rockstargames.com,hdslb.com,bilivideo.com,bilivideo.cn,biliapi.net,biliapi.com,bcdn.net,acgvideo.com,im9.com,polymas.com,aihaoke.net'
 
 if ($Mode -eq 'TUN') {
     Write-Host '=== 切换到 TUN 模式（Anycast 全权接管）===' -ForegroundColor Cyan
