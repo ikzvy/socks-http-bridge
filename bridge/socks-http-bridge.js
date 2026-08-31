@@ -13,6 +13,8 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const tls = require('tls');
+const http = require('http');
 const { execFile } = require('child_process');
 
 const LISTEN_HOST = '127.0.0.1';
@@ -341,14 +343,243 @@ function readProxyEnable() {
 }
 
 function runSwitchMode(mode) {
-  execFile('powershell.exe',
-    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', SWITCH_MODE_SCRIPT, '-Mode', mode],
-    { timeout: 30000, windowsHide: true },
-    (err) => {
-      wdBusy = false;
-      if (err) log(`watchdog: switch-mode ${mode} 失败: ${err.message}`);
-      else log(`watchdog: 系统代理已切换到 ${mode}`);
+  // 2026-08-31 事故：切换脚本曾卡满 30s 被超时杀掉，err.message 只有命令行、
+  // 没有任何原因，failover 静默失败。现在记录 killed/退出码/stderr 并自动重试一次。
+  const attempt = (n) => {
+    execFile('powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', SWITCH_MODE_SCRIPT, '-Mode', mode],
+      { timeout: 30000, windowsHide: true },
+      (err, stdout, stderr) => {
+        if (err) {
+          const detail = `killed=${err.killed ? '超时' : '否'} code=${err.code} stderr=${String(stderr || '').trim().slice(0, 200)}`;
+          if (n === 1) {
+            log(`watchdog: switch-mode ${mode} 失败(${detail})，2s 后重试`);
+            setTimeout(() => attempt(2), 2000);
+            return;
+          }
+          log(`watchdog: switch-mode ${mode} 失败(${detail})`);
+        } else {
+          log(`watchdog: 系统代理已切换到 ${mode}`);
+        }
+        wdBusy = false;
+      });
+  };
+  attempt(1);
+}
+
+// ---- 隧道健康探针：发现"1080 活着但隧道废了"的半死状态 ----
+// 只看 1080 在不在是不够的：Anycast 隧道会劣化成"能 SOCKS 握手、但真实数据
+// 被 reset"。探针每 TUNNEL_PROBE_EVERY 个 tick 经隧道完整请求一次国外探测页
+// （gstatic 的 generate_204，专为连通性检测设计、无账号、返回 204，正常浏览器
+// 也在后台频繁访问它，无风控/封号风险）。连续失败达到阈值就判定隧道劣化并弹窗。
+// 探针只走隧道（用 VPN 出口 IP），不影响任何真实请求的路由。
+const TUNNEL_PROBE_HOST = 'connectivitycheck.gstatic.com';
+const TUNNEL_PROBE_EVERY = 6;      // 每 6 个 tick(约30s) 探一次
+const TUNNEL_FAIL_THRESHOLD = 3;   // 连续 3 次失败(约90s) 判定劣化
+const NOTIFY_DEBOUNCE_MS = 10 * 60 * 1000; // 弹窗至少间隔 10 分钟，防刷屏
+
+let tunnelProbeCounter = 0;
+let tunnelFailStreak = 0;
+let tunnelDegraded = false;
+let lastNotifyMs = 0;
+
+function probeTunnelHealth() {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+    const timer = setTimeout(() => finish(false), 8000);
+    socksDial(TUNNEL_PROBE_HOST, 443)
+      .then(({ socket }) => {
+        const tlsSock = tls.connect({ socket, servername: TUNNEL_PROBE_HOST }, () => {
+          tlsSock.write(`GET /generate_204 HTTP/1.1\r\nHost: ${TUNNEL_PROBE_HOST}\r\nConnection: close\r\n\r\n`);
+        });
+        let head = '';
+        tlsSock.on('data', (d) => {
+          head += d.toString('latin1');
+          if (/^HTTP\/1\.[01] \d{3}/.test(head)) { clearTimeout(timer); tlsSock.destroy(); finish(true); }
+        });
+        tlsSock.on('error', () => { clearTimeout(timer); finish(false); });
+        tlsSock.on('close', () => clearTimeout(timer));
+      })
+      .catch(() => { clearTimeout(timer); finish(false); });
+  });
+}
+
+function notifyUser(title, text) {
+  const now = Date.now();
+  if (now - lastNotifyMs < NOTIFY_DEBOUNCE_MS) return;
+  lastNotifyMs = now;
+  // NotifyIcon 气泡，用内置 .NET，不装任何模块；日志里始终留有记录兜底。
+  const ps = 'Add-Type -AssemblyName System.Windows.Forms,System.Drawing; ' +
+    '$n = New-Object System.Windows.Forms.NotifyIcon; ' +
+    '$n.Icon = [System.Drawing.SystemIcons]::Warning; ' +
+    `$n.BalloonTipTitle = ${JSON.stringify(title)}; ` +
+    `$n.BalloonTipText = ${JSON.stringify(text)}; ` +
+    '$n.Visible = $true; $n.ShowBalloonTip(10000); ' +
+    'Start-Sleep -Seconds 12; $n.Dispose()';
+  execFile('powershell.exe', ['-NoProfile', '-Command', ps], { timeout: 20000, windowsHide: true }, () => {});
+}
+
+// ---- VPN 自动重连：隧道坏了先救活隧道，而不是只通知人 ----
+// 背景（2026-08-31 凌晨事故）：Anycast 隧道劣化/服务自发重启后不会自动重连，
+// 客户端 GUI 也不管，国外流量整夜不通，夜跑的自动化任务全部陪葬。
+// Anycast 服务本机 RPC 在 127.0.0.1:50000（/status /stop /start），
+// 用户手动点"连接"本质就是 POST /start 带一份 TunnelSettings。
+// 看门狗判定隧道劣化/半死时照做一遍即可自愈：
+//   - 参数实时取自客户端 user.config（账号/节点/DNS 偏好）+ /status（当前节点），
+//     用户换节点后重连依然跟着走；
+//   - 冷却 + 次数上限防抖，避免反复重连风暴；
+//   - 状态为 Disconnected 视为用户主动断开，绝不自动重连（尊重用户意图）。
+const ANYCAST_RPC_PORT = 50000;
+const RECONNECT_COOLDOWN_MS = 2 * 60 * 1000; // 两次重连尝试至少间隔 2 分钟
+const RECONNECT_MAX_ATTEMPTS = 3;            // 单次故障期内最多重连 3 次
+const RPC_DEAD_TUN_THRESHOLD = 8;            // 1080 死且服务 RPC 持续不可达约 2 分钟后才 TUN 兜底
+
+let reconnectAttempts = 0;
+let lastReconnectMs = 0;
+let reconnectBusy = false;
+let rpcDeadStreak = 0;
+
+function rpcCall(pathname, { method = 'GET', body = null, timeout = 5000 } = {}) {
+  return new Promise((resolve) => {
+    const payload = body ? JSON.stringify(body) : null;
+    const req = http.request({
+      host: '127.0.0.1',
+      port: ANYCAST_RPC_PORT,
+      path: pathname,
+      method,
+      headers: payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {},
+      timeout,
+    }, (res) => {
+      let data = '';
+      res.on('data', (d) => { data += d; });
+      res.on('end', () => {
+        let json = null;
+        try { json = JSON.parse(data); } catch (e) { /* 非 JSON 响应 */ }
+        resolve({ status: res.statusCode, json });
+      });
     });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+async function anycastStatus() {
+  const r = await rpcCall('/status');
+  return (r && r.json && r.json.success && r.json.data) ? r.json.data : null;
+}
+
+function findAnycastUserConfig() {
+  try {
+    const root = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Anycast');
+    let best = null;
+    let bestMtime = 0;
+    for (const urlDir of fs.readdirSync(root)) {
+      const dir = path.join(root, urlDir);
+      let st;
+      try { st = fs.statSync(dir); } catch (e) { continue; }
+      if (!st.isDirectory()) continue;
+      for (const ver of fs.readdirSync(dir)) {
+        const cfg = path.join(dir, ver, 'user.config');
+        try {
+          const cs = fs.statSync(cfg);
+          if (cs.mtimeMs > bestMtime) { bestMtime = cs.mtimeMs; best = cfg; }
+        } catch (e) { /* 该版本目录没有 user.config */ }
+      }
+    }
+    return best;
+  } catch (e) { return null; }
+}
+
+function cfgValue(xml, name) {
+  const m = new RegExp('<setting name="' + name + '"[^>]*>\\s*<value>([\\s\\S]*?)</value>').exec(xml);
+  return m ? m[1].trim() : '';
+}
+
+const DNS_PRESETS = {
+  google: ['8.8.8.8', '8.8.4.4'],
+  cloudflare: ['1.1.1.1', '1.0.0.1'],
+};
+
+// user.config 里 Account 是一整个序列化 JSON（含令牌等），不能整块往外发。
+// 只从中提取账号 uid（服务端要的是形如 u185193 的 account_uid）。
+function extractAccountUid(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  if (!s.startsWith('{')) return s; // 老版本可能直接存 uid 字符串
+  try {
+    const flat = [];
+    const walk = (o) => {
+      for (const [k, v] of Object.entries(o || {})) {
+        if (v && typeof v === 'object') walk(v);
+        else if (typeof v === 'string') flat.push([k.toLowerCase(), v]);
+      }
+    };
+    walk(JSON.parse(s));
+    // 优先级：键名含 uid 且值符合服务端格式 > 值符合格式 > 键名含 uid/id
+    for (const [k, v] of flat) if (k.includes('uid') && /^u\d+$/.test(v)) return v;
+    for (const [k, v] of flat) if (/^u\d{3,}$/.test(v)) return v;
+    for (const [k, v] of flat) if (k.includes('uid') || k === 'id') return v;
+    return null;
+  } catch (e) { return null; }
+}
+
+function buildTunnelSettings(fallbackNode) {
+  const cfgPath = findAnycastUserConfig();
+  if (!cfgPath) return null;
+  let xml;
+  try { xml = fs.readFileSync(cfgPath, 'utf8'); } catch (e) { return null; }
+  const accountUid = extractAccountUid(cfgValue(xml, 'Account'));
+  if (!accountUid) return null;
+  const dns = DNS_PRESETS[(cfgValue(xml, 'DnsServerIDName') || 'google').toLowerCase()] || DNS_PRESETS.google;
+  const smartCountries = cfgValue(xml, 'SmartRoutingCountries')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  return {
+    account_uid: accountUid,
+    node_idname: fallbackNode || cfgValue(xml, 'NodeIDName'),
+    routing_mode: (cfgValue(xml, 'RoutingModeIDName') || 'Smart').toLowerCase(),
+    primary_dns: dns[0],
+    secondary_dns: dns[1],
+    enable_tun: false,
+    enable_socks: true,
+    socks5_port: parseInt(cfgValue(xml, 'LocalSOCKS5Port'), 10) || SOCKS_PORT,
+    tunnel_mtu: parseInt(cfgValue(xml, 'TunnelMtu'), 10) || 1500,
+    enable_global_proxy: false,
+    allow_intranet: cfgValue(xml, 'AllowIntranet') === 'True',
+    resolve_bypass_locally: cfgValue(xml, 'ResolveBypassLocally') !== 'False',
+    use_downloaded_geo_database: false,
+    outbound_interface_guid: cfgValue(xml, 'OutboundInterfaceGuid'),
+    outbound_interface_name: cfgValue(xml, 'OutboundInterfaceName'),
+    smart_countries: smartCountries.length ? smartCountries : ['cn'],
+    smart_domain_suffix_enabled: cfgValue(xml, 'SmartRoutingUseDomainSuffixRules') === 'True',
+  };
+}
+
+async function reconnectVpn(reason) {
+  if (reconnectBusy) return;
+  const now = Date.now();
+  if (now - lastReconnectMs < RECONNECT_COOLDOWN_MS) return;
+  if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) return;
+  const st = await anycastStatus();
+  if (!st) { log('watchdog: 重连跳过——Anycast 服务 RPC 不可达'); return; }
+  if (st.state === 'Disconnected') return; // 用户主动断开的，不自动重连
+  reconnectBusy = true;
+  lastReconnectMs = now;
+  reconnectAttempts++;
+  try {
+    log(`watchdog: 尝试自动重连 VPN（${reason}，第 ${reconnectAttempts}/${RECONNECT_MAX_ATTEMPTS} 次）`);
+    const settings = buildTunnelSettings(st.node_idname);
+    if (!settings) { log('watchdog: 读不到 Anycast 客户端配置，放弃本次重连'); return; }
+    await rpcCall('/stop', { method: 'POST', timeout: 5000 });
+    await new Promise((r) => setTimeout(r, 2000));
+    const r = await rpcCall('/start', { method: 'POST', body: settings, timeout: 15000 });
+    if (r && r.json && r.json.success) log('watchdog: 重连请求已受理(/start)，等待隧道建立');
+    else log('watchdog: 重连 /start 返回异常: ' + (r ? JSON.stringify(r.json || r.status) : 'RPC 不可达'));
+  } finally {
+    reconnectBusy = false;
+  }
 }
 
 async function watchdogTick() {
@@ -357,13 +588,70 @@ async function watchdogTick() {
     const up = await probeSocks();
     if (up) { wdUpStreak++; wdDownStreak = 0; } else { wdDownStreak++; wdUpStreak = 0; }
 
+    // 隧道健康探针：1080 在，但还要定期验证隧道真能传数据（防"半死隧道"）
+    if (up) {
+      tunnelProbeCounter++;
+      if (tunnelProbeCounter >= TUNNEL_PROBE_EVERY) {
+        tunnelProbeCounter = 0;
+        const healthy = await probeTunnelHealth();
+        if (healthy) {
+          if (tunnelDegraded) { log('watchdog: 隧道恢复健康'); tunnelDegraded = false; }
+          tunnelFailStreak = 0;
+          reconnectAttempts = 0;
+          rpcDeadStreak = 0;
+        } else {
+          tunnelFailStreak++;
+          if (tunnelFailStreak >= TUNNEL_FAIL_THRESHOLD && !tunnelDegraded) {
+            tunnelDegraded = true;
+            log('watchdog: 隧道劣化（1080 在但国外连不通），尝试自动重连 VPN');
+            notifyUser('代理桥：隧道劣化', 'VPN 显示已连接但国外连不通，正在自动重连…');
+            await reconnectVpn('隧道劣化');
+          } else if (tunnelDegraded) {
+            await reconnectVpn('隧道仍劣化');
+            if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+              notifyUser('代理桥：自动重连失败', 'VPN 隧道劣化且自动重连次数用尽，请手动重连或切换节点。');
+            }
+          }
+        }
+      }
+    } else {
+      tunnelFailStreak = 0; // 1080 都没了，谈不上隧道健康，重置计数
+    }
+
     if (wdBusy) return;
     if (wdDownStreak >= WATCHDOG_DOWN_THRESHOLD) {
       wdDownStreak = 0;
-      if ((await readProxyEnable()) === true) {
-        wdBusy = true;
-        log('watchdog: 隧道(1080)持续不通，自动把系统代理切到 TUN');
-        runSwitchMode('TUN');
+      // 1080 全死。先问 Anycast 服务 RPC 区分三种情况：
+      //   状态 Disconnected = 用户主动断了 -> 不自动重连，沿用关代理逻辑；
+      //   RPC 不可达       = 服务挂了/在重启 -> 等它回来，等太久才 TUN 兜底；
+      //   其余（半死状态）  = 优先自动重连，重连用尽才 TUN 兜底。
+      const st = await anycastStatus();
+      if (st && st.state === 'Disconnected') {
+        if ((await readProxyEnable()) === true) {
+          wdBusy = true;
+          log('watchdog: VPN 为主动断开状态，把系统代理切到 TUN');
+          runSwitchMode('TUN');
+        }
+      } else if (!st) {
+        rpcDeadStreak++;
+        if (rpcDeadStreak >= RPC_DEAD_TUN_THRESHOLD) {
+          rpcDeadStreak = 0;
+          if ((await readProxyEnable()) === true) {
+            wdBusy = true;
+            log('watchdog: 隧道(1080)不通且 Anycast 服务长时间无响应，自动把系统代理切到 TUN');
+            runSwitchMode('TUN');
+          }
+        } else if (rpcDeadStreak === 1) {
+          log('watchdog: 隧道(1080)不通，Anycast 服务 RPC 暂不可达（可能在重启），等待恢复');
+        }
+      } else {
+        rpcDeadStreak = 0;
+        await reconnectVpn('隧道(1080)不通');
+        if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS && (await readProxyEnable()) === true) {
+          wdBusy = true;
+          log('watchdog: 自动重连次数用尽仍失败，把系统代理切到 TUN 兜底');
+          runSwitchMode('TUN');
+        }
       }
     } else if (wdUpStreak >= WATCHDOG_UP_THRESHOLD) {
       wdUpStreak = 0;
