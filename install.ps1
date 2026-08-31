@@ -60,7 +60,7 @@ $reg = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 Set-ItemProperty -Path $reg -Name ProxyEnable -Value 1
 Set-ItemProperty -Path $reg -Name ProxyServer -Value '127.0.0.1:18080'
 # 第一层绕过名单：高频国内域名 + 局域网（其余国内域名由桥内规则兜底）
-$bypass = '<local>;baidu.com;*.baidu.com;qq.com;*.qq.com;tencent.com;*.tencent.com;aliyun.com;*.aliyun.com;aliyuncs.com;*.aliyuncs.com;taobao.com;*.taobao.com;tmall.com;*.tmall.com;jd.com;*.jd.com;bilibili.com;*.bilibili.com;hdslb.com;*.hdslb.com;bilivideo.com;*.bilivideo.com;163.com;*.163.com;weibo.com;*.weibo.com;douyin.com;*.douyin.com;bytedance.com;*.bytedance.com'
+$bypass = '<local>;baidu.com;*.baidu.com;qq.com;*.qq.com;tencent.com;*.tencent.com;aliyun.com;*.aliyun.com;aliyuncs.com;*.aliyuncs.com;taobao.com;*.taobao.com;tmall.com;*.tmall.com;jd.com;*.jd.com;bilibili.com;*.bilibili.com;hdslb.com;*.hdslb.com;bilivideo.com;*.bilivideo.com;163.com;*.163.com;weibo.com;*.weibo.com;douyin.com;*.douyin.com;bytedance.com;*.bytedance.com;polymas.com;*.polymas.com'
 Set-ItemProperty -Path $reg -Name ProxyOverride -Value $bypass
 Write-Host 'ProxyServer=127.0.0.1:18080，绕过名单已写入'
 
