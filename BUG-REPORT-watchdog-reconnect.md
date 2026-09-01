@@ -141,3 +141,76 @@ curl --noproxy "*" -X POST http://127.0.0.1:50000/start \
 # → 400 Json deserialize error: missing field `node_address`
 # 3. 恢复：让用户打开 Anycast GUI 手动点「连接」（GUI 会自己拿机密并 POST 完整参数）
 ```
+
+---
+
+## 八、方案 A 侦查结果（2026-09-01，ildasm 静态反编译）
+
+> 用 .NET Framework ildasm（机器已装）把 `E:\Anycast\Anycast.exe` 全量导出 IL 后
+> 静态分析得出，未做任何联网验证。以下调用链完整闭环，机密字段来源全部查清。
+
+### 8.1 完整数据流
+
+```
+种子源(3 选 1，按序尝试)
+  1) GET https://list-cn-1304018649.cos.accelerate.myqcloud.com/list.txt   （纯文本，按 \n 分行、每行一个 URL，无加密——IL 已证实）
+  2) bilibili 空间公告接口（mid=3546720713575248）                          （备用，疑有加密，未深究也不需要）
+  3) bilibili 空间公告接口（mid=3493118083074873）                          （备用，同上）
+     ↓ 得到候选 API 基地址列表
+对每个候选调 GET/POST {base}/config（GetAppConfig）探活，成功者进故障转移列表（ApiBaseURLs）
+     ↓
+POST {api_base}/account/connect   ← 机密下发点
+  Header: Authorization: Bearer <AccessToken(user.config)>
+          AppPlatform: windows, AppVersion, AppBuild, AppLocale
+          Accept: application/json
+  Body:   { "device_uid":   <user.config UniqueIdentifier>,
+            "device_name":  <Environment.MachineName>,
+            "node_id_name": <节点，如 DP-SG>,
+            "use_hn_host":  <EnhancedMode 设置, false> }
+  Resp:   { success, data: { action: "connect"|"openurl"|"subscribe"|"logout",
+                             server_node: { host, port, path, transport, protocol, idname, name, country, ... },
+                             proxy_token: "...", account: {...}, dialog, url } }
+     ↓
+GUI 组装 31 字段 TunnelSettings → POST 127.0.0.1:50000/start
+```
+
+### 8.2 /start 完整 31 字段与取值来源（逐一查清）
+
+| 字段 | 来源 |
+|---|---|
+| account_uid / account_email | user.config Account JSON（uid/email，字段名 "uid"/"email"） |
+| node_idname | 当前节点（/status 可读） |
+| node_transport | server_node.transport != 0 ? "wss" : "ws" |
+| **node_address** | = server_node.host（若 host 是域名，GUI 会 DNS 解析后随机取一个 IP；直接用 host 应也可） |
+| node_host / node_port / node_path | server_node.host / port / path |
+| node_username | `Account.BuildProxyUsername()` = (AccountType 0→"trial:"，1→"pro:"，其他→"") + uid |
+| node_password | = connect 响应的 proxy_token |
+| routing_mode / primary_dns / secondary_dns | 用户设置（已实现） |
+| enable_tun / enable_socks | VpnMode 0→socks，1→tun（我们是 SOCKS 模式：false/true） |
+| enable_global_proxy / socks5_port / tunnel_mtu / allow_intranet / bypass_domains / resolve_bypass_locally | 用户设置（已实现；bypass_domains 此前漏传） |
+| user_sid | Windows 当前用户 SID（`WindowsIdentity.GetCurrent().User`；Node 里可用 `whoami /user`） |
+| app_downloads_path | `LocalServiceManager.BuildAppDataFolderPath()`（应用数据目录，未深究具体值，传 ~/.codex 或 Anycast 数据目录试试） |
+| use_downloaded_geo_database / outbound_interface_guid / outbound_interface_name / smart_countries / smart_domain_suffix_enabled | 用户设置（已实现） |
+| user_country_iso_code / node_country_iso_code | 可传 ""（服务端接受空串） |
+| debug_logging | false |
+
+### 8.3 实现清单与未验证项
+
+可直接实现（信息齐全）：种子 1 的纯文本列表解析、account/connect 请求构造、
+31 字段 payload 组装、/stop+/start 调用。
+
+**未验证（安全策略拦截了自动模式的联网探测，需用户本机手动跑一遍确认）**：
+1. `list.txt` 当前是否可达、内容格式（预期每行一个 `https://api.xxxx.com`）；
+2. `account/connect` 的真实响应包与字段名（snake_case 已从 JsonProperty 特性解出，
+   但建议实测一次核对）；
+3. 部分字段容忍度：node_address 直接传域名是否可行、app_downloads_path 传什么、
+   bypass_domains 传 "" 还是数组。
+
+建议下一步：写一个一次性验证脚本交给用户手动执行（读 user.config 的 token、
+GET list.txt、POST account/connect、打印脱敏后的响应结构），确认后再把逻辑写进桥。
+
+### 8.4 纪律
+
+- 验证/实现时凭据只在运行时从 user.config 读取，不进日志、不进对话、不提交。
+- 第二、三种子涉及公告解密逻辑，属于不需要也不应继续深挖的部分，跳过。
+
