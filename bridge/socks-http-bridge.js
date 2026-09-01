@@ -425,7 +425,11 @@ function notifyUser(title, text) {
 // 客户端 GUI 也不管，国外流量整夜不通，夜跑的自动化任务全部陪葬。
 // Anycast 服务本机 RPC 在 127.0.0.1:50000（/status /stop /start），
 // 用户手动点"连接"本质就是 POST /start 带一份 TunnelSettings。
-// 看门狗判定隧道劣化/半死时照做一遍即可自愈：
+// 看门狗判定隧道劣化/半死时照做一遍尝试自愈。注意：/start 需要完整
+// TunnelSettings，其中 node_address 等一组"隧道机密"字段由云端下发给
+// GUI、不落盘，本机配置拼不出来——所以重连可能被服务端 400 拒绝。
+// 重连失败不僵死：次数用尽后由「劣化切 TUN」兜底（见 watchdogTick），
+// 未来机密字段补齐后此路径自然恢复真正的自愈。
 //   - 参数实时取自客户端 user.config（账号/节点/DNS 偏好）+ /status（当前节点），
 //     用户换节点后重连依然跟着走；
 //   - 冷却 + 次数上限防抖，避免反复重连风暴；
@@ -575,8 +579,17 @@ async function reconnectVpn(reason) {
     await rpcCall('/stop', { method: 'POST', timeout: 5000 });
     await new Promise((r) => setTimeout(r, 2000));
     const r = await rpcCall('/start', { method: 'POST', body: settings, timeout: 15000 });
-    if (r && r.json && r.json.success) log('watchdog: 重连请求已受理(/start)，等待隧道建立');
-    else log('watchdog: 重连 /start 返回异常: ' + (r ? JSON.stringify(r.json || r.status) : 'RPC 不可达'));
+    if (r && r.json && r.json.success) {
+      log('watchdog: 重连请求已受理(/start)，等待隧道建立');
+    } else if (r && r.status === 400) {
+      // 400 = 服务端直接拒绝请求体（实测缺 node_address 等一组隧道机密字段，
+      // 这些值由云端下发给 GUI、不落盘，本地配置读不到）。重试不改变结果，
+      // 直接判用尽，让调用方尽快走 TUN 兜底；将来参数补齐后自然恢复。
+      reconnectAttempts = RECONNECT_MAX_ATTEMPTS;
+      log('watchdog: /start 被拒(400)，重连参数不完整，放弃重连: ' + JSON.stringify(r.json || '').slice(0, 200));
+    } else {
+      log('watchdog: 重连 /start 返回异常: ' + (r ? JSON.stringify(r.json || r.status) : 'RPC 不可达'));
+    }
   } finally {
     reconnectBusy = false;
   }
@@ -608,9 +621,17 @@ async function watchdogTick() {
             await reconnectVpn('隧道劣化');
           } else if (tunnelDegraded) {
             await reconnectVpn('隧道仍劣化');
-            if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
-              notifyUser('代理桥：自动重连失败', 'VPN 隧道劣化且自动重连次数用尽，请手动重连或切换节点。');
+          }
+          // 劣化 + 重连无望（次数用尽，含被 /start 400 快速判死）→ 切 TUN 兜底：
+          // 国内直连继续可用、国外快速失败、弹窗明确提示。不切的话就是
+          // "代理指着桥、桥指着半死隧道"的卡死盲区（2026-08-31 凌晨事故路径）。
+          if (tunnelDegraded && reconnectAttempts >= RECONNECT_MAX_ATTEMPTS && !wdBusy) {
+            if ((await readProxyEnable()) === true) {
+              wdBusy = true;
+              log('watchdog: 隧道劣化且自动重连无望，把系统代理切到 TUN 兜底');
+              runSwitchMode('TUN');
             }
+            notifyUser('代理桥：隧道劣化', '自动重连失败，已切到直连兜底。请手动重连 VPN 或切换节点。');
           }
         }
       }
@@ -655,7 +676,9 @@ async function watchdogTick() {
       }
     } else if (wdUpStreak >= WATCHDOG_UP_THRESHOLD) {
       wdUpStreak = 0;
-      if ((await readProxyEnable()) === false) {
+      // 劣化期间 1080 活着也不切回 Bridge——否则会和上面的劣化 TUN 兜底乒乓；
+      // 等健康探针确认恢复（清除 tunnelDegraded）后才允许切回。
+      if ((await readProxyEnable()) === false && !tunnelDegraded) {
         wdBusy = true;
         log('watchdog: 隧道(1080)已恢复，自动把系统代理切到 Bridge');
         runSwitchMode('Bridge');

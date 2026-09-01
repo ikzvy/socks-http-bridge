@@ -1,0 +1,143 @@
+# Bug 报告：看门狗「VPN 自动重连」功能从未成功
+
+> 状态：已诊断，未修复。2026-09-01 由 WorkBuddy 诊断。
+> 交付给接手修复的 agent 使用。本报告自包含，无需依赖对话上下文。
+
+---
+
+## 一、现象（一句话）
+
+看门狗在 VPN 隧道故障时尝试自动重连，但 `/start` 请求被 Anycast 服务端拒绝，**该功能自提交 `3740002` 上线以来从未成功过一次**。隧道真正故障时，只能靠「切 TUN + 弹窗」的旧兜底路径，且存在一个让它彻底卡死的盲区（见第六节）。
+
+## 二、根因（已实锤）
+
+`bridge/socks-http-bridge.js` 里的 `buildTunnelSettings()` 构造的 `/start` 请求体**缺少整组「隧道机密」字段**。Anycast 服务端（Rust serde）反序列化时直接失败：
+
+```
+POST http://127.0.0.1:50000/start
+→ HTTP 400
+  body: Json deserialize error: missing field `node_address` at line 1 column 431
+```
+
+补一个字段会报下一个，是**结构性缺字段**，不是认证问题（带 Bearer token 也同样是 400）。
+
+### 缺失字段清单
+
+从 `anycast-service.exe`（Rust 二进制）的 Sentry 脱敏清单 + `Anycast.exe`（.NET GUI）的属性 getter 挖出的完整集合：
+
+| 字段 | 说明 |
+|---|---|
+| `node_address` | 节点地址（serde 必填，第一个报错的就是它） |
+| `node_host` | 节点主机 |
+| `node_port` | 节点端口 |
+| `node_path` | websocket 路径 |
+| `node_username` | 节点用户名 |
+| `node_password` | 节点密码 |
+| `node_transport` | 传输协议 |
+| `use_hn_host` | 是否用 HN 主机头 |
+| （可能还有）`bypass_domains`、`proxy_token` | 待确认 |
+
+## 三、代码定位
+
+文件：`bridge/socks-http-bridge.js`
+
+- `buildTunnelSettings(fallbackNode)` — 约第 529–558 行。**问题所在**：只从 `user.config` 读字段，但 `user.config` 里根本没有地址/凭据类字段。
+- `reconnectVpn(reason)` — 约第 560–583 行。调用 `/stop` → `/start`。
+- `watchdogTick()` — 约第 585–668 行。看门狗主循环。
+- `rpcCall()` / `anycastStatus()` — 约第 443–472 行。本机 RPC 封装。
+
+`user.config` 实际只有 14 个 setting（已逐一核实），**没有**任何地址/凭据字段：
+`AccessToken, RefreshToken, UpgradeRequired, Account, NodeIDName, UniqueIdentifier, CultureCode, VpnModeIDName, AllowIntranet, SystemWideProxy, ExpandedRegions, GeoAllDatabaseUpdate, LastDetectedCountryIsoCode, FavoriteNodeIDNames`
+
+因此 `buildTunnelSettings` 里 12 个读取项有 9 个必然取到空串，走硬编码默认值；而真正必填的 `node_address` 等根本没被读取。
+
+## 四、已核实的关键事实（别重复踩坑）
+
+### 4.1 服务端（Anycast VPN Service v1.0.49，Rust）
+
+- RPC 地址：`127.0.0.1:50000`，仅 4 个端点，已逐一探测确认：
+  - `GET /` → 返回服务名 + 连接状态
+  - `GET /status` → `{"success":true,"data":{"state":"Connected","node_idname":"DP-SG",...}}`
+  - `POST /stop` → 断隧道
+  - `POST /start` → 建隧道（**需要完整 TunnelSettings，缺字段即 400**）
+- 没有节点列表端点（`/nodes`、`/servers` 等全部 404）。
+- 服务日志：`E:\Anycast\anycast-service.log`，会记录 GUI 手动连接时的 `TunnelSettings {...}`，但机密字段被 Rust Debug 格式的 `..` 省略（拿不到值）。
+- 服务二进制：`E:\Anycast\anycast-service.exe`（15MB）。
+
+### 4.2 GUI 客户端（Anycast.exe，.NET，1.8MB）
+
+- 安装目录：`E:\Anycast\`
+- `user.config` 路径：`%LOCALAPPDATA%\Anycast\Anycast.exe_Url_sxwlluiygsp2b1xomptxbtgk5t2k03yz\1.0.49.35106\user.config`
+- GUI 里有 `BuildTunnelSettingsPayload` 方法、`StartConnection` 方法——**机密字段的值是 GUI 从云端拿到后拼进请求体的，不落盘**。
+- GUI 二进制的属性 getter 里有完整字段名：`get_node_address / get_node_host / get_node_port / get_node_path / get_node_username / get_node_password / get_node_transport / get_use_hn_host / get_bypass_domains`。
+
+### 4.3 云端引导 API（国内直连可达，无需隧道）
+
+- 域名（会轮换，从桥日志 `direct by bootstrap rule` 记录提取）：`api.8a5da52.com`、`api.de4df61ce.com`、`api.083587cba.com`、`api.bd5b1602d.com`
+- 认证：HTTP Header `Authorization: Bearer <AccessToken>`（token 在 user.config 的 `AccessToken`，229 字符）。
+- **已知可用端点**：`POST /nodes/list_anycast` → 返回 64 个节点的**基础信息**（idname/name/region/country/type），**不含机密字段**。
+- **已试过并 404 的端点**（不要重复猜这些）：`/nodes` `/api/nodes` `/v1/nodes` `/api/v1/nodes` `/user/nodes` `/servers` `/api/servers` `/node/list` `/api/user/nodes` `/api/v1/servers` `/api/v1/node/list` `/client/nodes` `/api/client/nodes` `/member/nodes` `/api/member/nodes` `/api/v1/member/nodes` `/nodes/node_info` `/nodes/get_node` `/nodes/connect` `/node/info` `/userSettings/<uid>` `/userSettings` `/userSettings/get` `/proxy_config` `/nodes/list_anycast_full` `/nodes/connect_node`
+- `/config` 可用但只有 `app_config` 和 `user_ip`，无关。
+- GUI 字符串里还有 `userSettings/`（带尾斜杠的前缀）——**这是尚未深挖的线索**，可能是取机密的端点前缀。
+
+## 五、修复方向
+
+### 方案 A · 治本：补齐机密字段
+
+需要搞清楚 GUI 从哪个端点、以什么格式拿到 `node_address` 等值。可行途径：
+
+1. **反编译 GUI**：`E:\Anycast\Anycast.exe`（.NET，可用 ILSpy / dnSpy / dotnet-ildasm 反编译），看 `BuildTunnelSettingsPayload` 的实现和它调用的 API 端点。这是最直接的路。
+2. **抓 GUI 连接时的 API 流量**：GUI 走 `api.*.com`（HTTPS），需要中间人或 Hosts+自签证书；或看 `anycast-service.log` 在 GUI 连接瞬间的记录。
+3. 补全 `buildTunnelSettings()`：拿到机密后，构造出含 `node_address / node_host / node_port / node_path / node_username / node_password / node_transport / use_hn_host` 的完整请求体。
+
+风险：Anycast 是私有协议，版本升级可能改端点/字段，治本方案会漂移。
+
+### 方案 B · 止血：修好「切 TUN」兜底（独立于 A，建议先做）
+
+当前 `watchdogTick()` 的兜底逻辑有个盲区——**只认「1080 端口死」才切 TUN**：
+
+```js
+if (up) {           // 1080 端口通
+  ... 隧道健康探针 ...
+  if (劣化) { reconnectVpn(...) }   // 只重连，不切 TUN
+} else {
+  wdDownStreak++    // 只有 1080 端口死才累积
+}
+if (wdDownStreak >= 3) { ... 切 TUN ... }
+```
+
+**隧道「半死」场景（1080 端口还监听、但数据被 reset）**：
+- 健康探针连续失败 → `reconnectVpn` → 必 400 → 重连失败
+- 但 1080 还在 → `wdDownStreak` 永远为 0 → **永远不会切 TUN**
+- 结果：系统代理还指着桥、桥还指着半死的隧道，国外一直不通，弹窗又被 10 分钟冷却压着 → 用户彻底卡死无感知
+
+**止血改动**：在「隧道劣化且重连失败（或次数用尽）」时，也走「切 TUN + 弹窗」兜底。这样任何 VPN 故障都能保证国内直连不中断 + 明确提示用户手动重连。
+
+### 建议顺序
+
+先做 B（改动小、独立于私有协议、立竿见影），再研究 A。
+
+## 六、环境与约束
+
+- 项目：`F:\socks-http-bridge`，纯 Node.js 零依赖。桥只监听 `127.0.0.1:18080`。
+- 运行副本在 `%USERPROFILE%\.codex\`（仓库代码 ≠ 运行代码）。
+- **维护规则（来自 AGENTS.md，必须遵守）**：
+  1. 改完 `bridge/*.js` 必须立即 `deploy.ps1` 部署并验证（`pwsh` 执行，非 powershell.exe）。
+  2. 提交即推送（中文提交信息）。
+  3. 不引入 npm 依赖；不提交 `cn-domains.txt`、`*.log`。
+  4. 桥的防泄露红线：国外流量**永不降级直连**。
+- 本机 shell 有全局代理 `http_proxy=http://127.0.0.1:2165`；探测 `127.0.0.1` 服务要用 `curl --noproxy "*"`（否则假 502）。
+- 注意：`C:\Program Files (x86)\Anycast\server.json` 含 socks 凭据（明文密码），`user.config` 含 AccessToken——**别把这两个文件的内容提交或外发**。
+
+## 七、复现方法（供修复后验证）
+
+```bash
+# 1. 断隧道
+curl --noproxy "*" -X POST http://127.0.0.1:50000/stop
+# 2. 用旧参数重连（会 400，复现 bug）
+curl --noproxy "*" -X POST http://127.0.0.1:50000/start \
+  -H "Content-Type: application/json" \
+  -d '{"account_uid":"u185193","node_idname":"DP-SG","routing_mode":"smart","primary_dns":"8.8.8.8","secondary_dns":"8.8.4.4","enable_tun":false,"enable_socks":true,"socks5_port":1080,"tunnel_mtu":1500,"enable_global_proxy":false,"allow_intranet":true,"resolve_bypass_locally":true,"use_downloaded_geo_database":false,"outbound_interface_guid":"","outbound_interface_name":"","smart_countries":["cn"],"smart_domain_suffix_enabled":false}'
+# → 400 Json deserialize error: missing field `node_address`
+# 3. 恢复：让用户打开 Anycast GUI 手动点「连接」（GUI 会自己拿机密并 POST 完整参数）
+```
