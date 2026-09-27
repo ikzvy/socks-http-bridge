@@ -60,7 +60,7 @@ $reg = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 Set-ItemProperty -Path $reg -Name ProxyEnable -Value 1
 Set-ItemProperty -Path $reg -Name ProxyServer -Value '127.0.0.1:18080'
 # 第一层绕过名单：高频国内域名 + 局域网（其余国内域名由桥内规则兜底）
-$bypass = '<local>;baidu.com;*.baidu.com;qq.com;*.qq.com;tencent.com;*.tencent.com;aliyun.com;*.aliyun.com;aliyuncs.com;*.aliyuncs.com;taobao.com;*.taobao.com;tmall.com;*.tmall.com;jd.com;*.jd.com;bilibili.com;*.bilibili.com;hdslb.com;*.hdslb.com;bilivideo.com;*.bilivideo.com;163.com;*.163.com;weibo.com;*.weibo.com;douyin.com;*.douyin.com;bytedance.com;*.bytedance.com;polymas.com;*.polymas.com;aihaoke.net;*.aihaoke.net;chsi.com.cn;*.chsi.com.cn;quark.cn;*.quark.cn'
+$bypass = '<local>;baidu.com;*.baidu.com;qq.com;*.qq.com;tencent.com;*.tencent.com;aliyun.com;*.aliyun.com;aliyuncs.com;*.aliyuncs.com;taobao.com;*.taobao.com;tmall.com;*.tmall.com;jd.com;*.jd.com;bilibili.com;*.bilibili.com;hdslb.com;*.hdslb.com;bilivideo.com;*.bilivideo.com;163.com;*.163.com;weibo.com;*.weibo.com;douyin.com;*.douyin.com;bytedance.com;*.bytedance.com;polymas.com;*.polymas.com;aihaoke.net;*.aihaoke.net;chsi.com.cn;*.chsi.com.cn;quark.cn;*.quark.cn;qianwenaiapi.com;*.qianwenaiapi.com;qianwenai.com;*.qianwenai.com;bigmodel.cn;*.bigmodel.cn'
 Set-ItemProperty -Path $reg -Name ProxyOverride -Value $bypass
 Write-Host 'ProxyServer=127.0.0.1:18080，绕过名单已写入'
 
@@ -68,7 +68,9 @@ Write-Host '=== [5/7] 配置用户环境变量（CLI 工具用）===' -Foregroun
 Set-ItemProperty 'HKCU:\Environment' -Name HTTP_PROXY  -Value 'http://127.0.0.1:18080'
 Set-ItemProperty 'HKCU:\Environment' -Name HTTPS_PROXY -Value 'http://127.0.0.1:18080'
 Set-ItemProperty 'HKCU:\Environment' -Name ALL_PROXY   -Value 'http://127.0.0.1:18080'
-Set-ItemProperty 'HKCU:\Environment' -Name NO_PROXY    -Value 'localhost,127.0.0.1,::1,bilibili.com,hdslb.com,bilivideo.com'
+# 与 switch-mode.ps1 的 $noProxy 保持一致（两处需同步改）：CLI 读环境变量不看 ProxyOverride，
+# Claude Code 等第三方 API 端点必须列在这里，否则被送进海外隧道。
+Set-ItemProperty 'HKCU:\Environment' -Name NO_PROXY -Value 'localhost,127.0.0.1,::1,qoder.com.cn,qoder.com,qoder.cn,qoder.sh,aliyuncs.com,codebuddy.cn,codebuddy.com,doubao.com,cici.com,dola.com,volces.com,volcengine.com,xiaoheihe.net,heybox.com,maxjia.com,steamstatic.com,epicgames.com,battlenet.com,blizzard.com,ea.com,ubisoft.com,riotgames.com,rockstargames.com,hdslb.com,bilivideo.com,bilivideo.cn,biliapi.net,biliapi.com,bcdn.net,acgvideo.com,im9.com,polymas.com,aihaoke.net,chsi.com.cn,quark.cn,qianwenaiapi.com,qianwenai.com,bigmodel.cn'
 Write-Host '环境变量已写入（新开的终端才生效）'
 
 # 广播代理设置变更
