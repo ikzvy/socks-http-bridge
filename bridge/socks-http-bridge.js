@@ -346,7 +346,8 @@ function runSwitchMode(mode) {
   // 2026-08-31 事故：切换脚本曾卡满 30s 被超时杀掉，err.message 只有命令行、
   // 没有任何原因，failover 静默失败。现在记录 killed/退出码/stderr 并自动重试一次。
   const attempt = (n) => {
-    execFile('powershell.exe',
+    // 全局维护约定：PowerShell 一律走 pwsh（7+），禁止 Windows PowerShell 5.1
+    execFile('pwsh',
       ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', SWITCH_MODE_SCRIPT, '-Mode', mode],
       { timeout: 30000, windowsHide: true },
       (err, stdout, stderr) => {
@@ -405,9 +406,9 @@ function probeTunnelHealth() {
   });
 }
 
-function notifyUser(title, text) {
+function notifyUser(title, text, force = false) {
   const now = Date.now();
-  if (now - lastNotifyMs < NOTIFY_DEBOUNCE_MS) return;
+  if (!force && now - lastNotifyMs < NOTIFY_DEBOUNCE_MS) return;
   lastNotifyMs = now;
   // NotifyIcon 气泡，用内置 .NET，不装任何模块；日志里始终留有记录兜底。
   const ps = 'Add-Type -AssemblyName System.Windows.Forms,System.Drawing; ' +
@@ -417,7 +418,7 @@ function notifyUser(title, text) {
     `$n.BalloonTipText = ${JSON.stringify(text)}; ` +
     '$n.Visible = $true; $n.ShowBalloonTip(10000); ' +
     'Start-Sleep -Seconds 12; $n.Dispose()';
-  execFile('powershell.exe', ['-NoProfile', '-Command', ps], { timeout: 20000, windowsHide: true }, () => {});
+  execFile('pwsh', ['-NoProfile', '-Command', ps], { timeout: 20000, windowsHide: true }, () => {});
 }
 
 // ---- VPN 自动重连：隧道坏了先救活隧道，而不是只通知人 ----
@@ -439,10 +440,23 @@ const RECONNECT_COOLDOWN_MS = 2 * 60 * 1000; // 两次重连尝试至少间隔 2
 const RECONNECT_MAX_ATTEMPTS = 3;            // 单次故障期内最多重连 3 次
 const RPC_DEAD_TUN_THRESHOLD = 8;            // 1080 死且服务 RPC 持续不可达约 2 分钟后才 TUN 兜底
 
+// ---- 自发掉线判别 ----
+// 2026-09 实测：一个月内 61 次 RPC 报 Disconnected 的掉线全部伴随 Anycast GUI
+// 进程退出/重启（anycast-gui.log 每次隧道恢复前都有 "session start"），而手动
+// 点"断开"不会重启进程。因此用两条证据区分"用户手动断开"和"客户端自发掉线"：
+// GUI 进程不在运行，或 GUI 在这个窗口内刚(重)启动过。
+const ANYCAST_GUI_EXE = 'Anycast.exe';
+const ANYCAST_GUI_LOG = path.join(
+  process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
+  'Anycast', 'anycast-gui.log'
+);
+const GUI_RESTART_WINDOW_MS = 4 * 60 * 1000;
+
 let reconnectAttempts = 0;
 let lastReconnectMs = 0;
 let reconnectBusy = false;
 let rpcDeadStreak = 0;
+let lastDropNotice = null; // 最近一次掉线提醒 {kind, at}，隧道恢复时用于闭环气泡
 
 function rpcCall(pathname, { method = 'GET', body = null, timeout = 5000 } = {}) {
   return new Promise((resolve) => {
@@ -561,14 +575,41 @@ function buildTunnelSettings(fallbackNode) {
   };
 }
 
-async function reconnectVpn(reason) {
+function anycastGuiRecentlyStarted() {
+  try {
+    const text = fs.readFileSync(ANYCAST_GUI_LOG, 'utf8');
+    const re = /session start\s+(\S+)/g;
+    let m, last = null;
+    while ((m = re.exec(text)) !== null) last = m[1];
+    if (!last) return false;
+    const t = Date.parse(last);
+    return !Number.isNaN(t) && Date.now() - t < GUI_RESTART_WINDOW_MS;
+  } catch (e) { return false; }
+}
+
+function anycastGuiRunning() {
+  return new Promise((resolve) => {
+    // 直接全量列出再匹配：最简单也最稳，不依赖 /FI 的参数切分
+    execFile('tasklist', ['/FO', 'CSV', '/NH'], { windowsHide: true, timeout: 5000 }, (err, stdout) => {
+      if (err) return resolve(true); // 查询失败按"在运行"处理，退回旧行为
+      resolve(String(stdout || '').toLowerCase().includes('"' + ANYCAST_GUI_EXE.toLowerCase() + '"'));
+    });
+  });
+}
+
+// Disconnected 状态的定性：GUI 不在运行或刚重启过 = 自发掉线；否则按用户手动断开
+async function isSpontaneousDrop() {
+  return !(await anycastGuiRunning()) || anycastGuiRecentlyStarted();
+}
+
+async function reconnectVpn(reason, allowDisconnected = false) {
   if (reconnectBusy) return;
   const now = Date.now();
   if (now - lastReconnectMs < RECONNECT_COOLDOWN_MS) return;
   if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) return;
   const st = await anycastStatus();
   if (!st) { log('watchdog: 重连跳过——Anycast 服务 RPC 不可达'); return; }
-  if (st.state === 'Disconnected') return; // 用户主动断开的，不自动重连
+  if (st.state === 'Disconnected' && !allowDisconnected) return; // 用户主动断开的，不自动重连
   reconnectBusy = true;
   lastReconnectMs = now;
   reconnectAttempts++;
@@ -632,6 +673,7 @@ async function watchdogTick() {
               runSwitchMode('TUN');
             }
             notifyUser('代理桥：隧道劣化', '自动重连失败，已切到直连兜底。请手动重连 VPN 或切换节点。');
+            lastDropNotice = { kind: 'spontaneous', at: Date.now() };
           }
         }
       }
@@ -648,9 +690,26 @@ async function watchdogTick() {
       //   其余（半死状态）  = 优先自动重连，重连用尽才 TUN 兜底。
       const st = await anycastStatus();
       if (st && st.state === 'Disconnected') {
-        if ((await readProxyEnable()) === true) {
+        if (await isSpontaneousDrop()) {
+          // 客户端自己挂了，不是用户断的：先提醒，再尝试重连。不立即切 TUN——
+          // GUI 自愈拉起隧道后一切原样（重连会因缺隧道机密被 400，次数用尽后
+          // 走下面的 TUN 兜底）。2026-09-29 前这里是静默的，用户只能靠 GPT 转圈
+          // 感知掉线。
+          log('watchdog: VPN 疑似自发掉线（Anycast GUI 退出或刚重启），尝试重连');
+          notifyUser('代理桥：VPN 自发掉线', 'Anycast 客户端退出/重启导致隧道断开，正在等待自愈并尝试重连…');
+          lastDropNotice = { kind: 'spontaneous', at: Date.now() };
+          await reconnectVpn('VPN 自发掉线', true);
+          if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS && (await readProxyEnable()) === true) {
+            wdBusy = true;
+            log('watchdog: 自发掉线且重连无望，把系统代理切到 TUN 兜底');
+            runSwitchMode('TUN');
+          }
+        } else if ((await readProxyEnable()) === true) {
+          // GUI 活着且没重启过 → 维持"用户手动断开"的旧判定
           wdBusy = true;
           log('watchdog: VPN 为主动断开状态，把系统代理切到 TUN');
+          notifyUser('代理桥：VPN 已断开', '检测到 VPN 断开，系统代理已切到直连。');
+          lastDropNotice = { kind: 'manual', at: Date.now() };
           runSwitchMode('TUN');
         }
       } else if (!st) {
@@ -660,6 +719,8 @@ async function watchdogTick() {
           if ((await readProxyEnable()) === true) {
             wdBusy = true;
             log('watchdog: 隧道(1080)不通且 Anycast 服务长时间无响应，自动把系统代理切到 TUN');
+            notifyUser('代理桥：隧道不可用', 'Anycast 服务长时间无响应，已切到直连兜底。');
+            lastDropNotice = { kind: 'spontaneous', at: Date.now() };
             runSwitchMode('TUN');
           }
         } else if (rpcDeadStreak === 1) {
@@ -671,6 +732,8 @@ async function watchdogTick() {
         if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS && (await readProxyEnable()) === true) {
           wdBusy = true;
           log('watchdog: 自动重连次数用尽仍失败，把系统代理切到 TUN 兜底');
+          notifyUser('代理桥：隧道不可用', '自动重连失败，已切到直连兜底。请手动重连 VPN。');
+          lastDropNotice = { kind: 'spontaneous', at: Date.now() };
           runSwitchMode('TUN');
         }
       }
@@ -682,6 +745,14 @@ async function watchdogTick() {
         wdBusy = true;
         log('watchdog: 隧道(1080)已恢复，自动把系统代理切到 Bridge');
         runSwitchMode('Bridge');
+      }
+      // 有过掉线提醒的话，恢复时闭环提示一条（force 绕过 10 分钟冷却，
+      // 否则几分钟内的短掉线恢复会被上一次掉线气泡的冷却吞掉）。
+      if (lastDropNotice) {
+        if (Date.now() - lastDropNotice.at < 30 * 60 * 1000) {
+          notifyUser('代理桥：VPN 已恢复', '隧道重新可用，国外流量恢复正常路由。', true);
+        }
+        lastDropNotice = null;
       }
     }
   } catch (e) {
