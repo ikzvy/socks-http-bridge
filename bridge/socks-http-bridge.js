@@ -406,19 +406,20 @@ function probeTunnelHealth() {
   });
 }
 
+// PS 单引号字符串转义：内部单引号翻倍（JSON.stringify 的 \" 在 PowerShell 里不合法）
+const psQuote = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+
 function notifyUser(title, text, force = false) {
   const now = Date.now();
   if (!force && now - lastNotifyMs < NOTIFY_DEBOUNCE_MS) return;
   lastNotifyMs = now;
-  // NotifyIcon 气泡，用内置 .NET，不装任何模块；日志里始终留有记录兜底。
-  const ps = 'Add-Type -AssemblyName System.Windows.Forms,System.Drawing; ' +
-    '$n = New-Object System.Windows.Forms.NotifyIcon; ' +
-    '$n.Icon = [System.Drawing.SystemIcons]::Warning; ' +
-    `$n.BalloonTipTitle = ${JSON.stringify(title)}; ` +
-    `$n.BalloonTipText = ${JSON.stringify(text)}; ` +
-    '$n.Visible = $true; $n.ShowBalloonTip(10000); ' +
-    'Start-Sleep -Seconds 12; $n.Dispose()';
-  execFile('pwsh', ['-NoProfile', '-Command', ps], { timeout: 20000, windowsHide: true }, () => {});
+  // 用 WScript.Shell Popup 弹窗（15 秒自动关闭），不用 NotifyIcon 气泡：
+  // 2026-09-30 实测两次掉线的气泡命令都执行了，但 Win11 从未显示（含通知中心）。
+  // Popup 是普通窗口，不受通知设置/勿扰模式影响，保证肉眼可见。
+  const ps = '$w = New-Object -ComObject WScript.Shell; ' +
+    `$w.Popup(${psQuote(text)}, 15, ${psQuote(title)}, 64) | Out-Null`;
+  execFile('pwsh', ['-NoProfile', '-Command', ps], { timeout: 20000, windowsHide: true },
+    (err) => { if (err) log('watchdog: 弹窗失败 ' + (err.killed ? '超时' : err.message)); });
 }
 
 // ---- VPN 自动重连：隧道坏了先救活隧道，而不是只通知人 ----
@@ -456,7 +457,8 @@ let reconnectAttempts = 0;
 let lastReconnectMs = 0;
 let reconnectBusy = false;
 let rpcDeadStreak = 0;
-let lastDropNotice = null; // 最近一次掉线提醒 {kind, at}，隧道恢复时用于闭环气泡
+let lastDropNotice = null; // 最近一次掉线提醒 {kind, at}，隧道恢复时用于闭环弹窗
+let dropActive = false;    // 掉线事件进行中：提醒/记日志只在事件开始时做一次（防 15s 一条刷屏）
 
 function rpcCall(pathname, { method = 'GET', body = null, timeout = 5000 } = {}) {
   return new Promise((resolve) => {
@@ -690,13 +692,17 @@ async function watchdogTick() {
       //   其余（半死状态）  = 优先自动重连，重连用尽才 TUN 兜底。
       const st = await anycastStatus();
       if (st && st.state === 'Disconnected') {
+        const firstAnnounce = !dropActive;
+        dropActive = true;
         if (await isSpontaneousDrop()) {
           // 客户端自己挂了，不是用户断的：先提醒，再尝试重连。不立即切 TUN——
           // GUI 自愈拉起隧道后一切原样（重连会因缺隧道机密被 400，次数用尽后
           // 走下面的 TUN 兜底）。2026-09-29 前这里是静默的，用户只能靠 GPT 转圈
           // 感知掉线。
-          log('watchdog: VPN 疑似自发掉线（Anycast GUI 退出或刚重启），尝试重连');
-          notifyUser('代理桥：VPN 自发掉线', 'Anycast 客户端退出/重启导致隧道断开，正在等待自愈并尝试重连…');
+          if (firstAnnounce) {
+            log('watchdog: VPN 疑似自发掉线（Anycast GUI 退出或刚重启），尝试重连');
+            notifyUser('代理桥：VPN 自发掉线', 'Anycast 客户端退出/重启导致隧道断开，正在等待自愈并尝试重连…');
+          }
           lastDropNotice = { kind: 'spontaneous', at: Date.now() };
           await reconnectVpn('VPN 自发掉线', true);
           if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS && (await readProxyEnable()) === true) {
@@ -747,7 +753,8 @@ async function watchdogTick() {
         runSwitchMode('Bridge');
       }
       // 有过掉线提醒的话，恢复时闭环提示一条（force 绕过 10 分钟冷却，
-      // 否则几分钟内的短掉线恢复会被上一次掉线气泡的冷却吞掉）。
+      // 否则几分钟内的短掉线恢复会被上一次掉线弹窗的冷却吞掉）。
+      dropActive = false;
       if (lastDropNotice) {
         if (Date.now() - lastDropNotice.at < 30 * 60 * 1000) {
           notifyUser('代理桥：VPN 已恢复', '隧道重新可用，国外流量恢复正常路由。', true);
